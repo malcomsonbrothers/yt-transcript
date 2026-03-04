@@ -58,11 +58,37 @@ def transcribe_parakeet(model_id: str, audio_path: str, device: str) -> str:
     return ""
 
 
-def transcribe_parakeet_mlx(model_id: str, mlx_model_id: str, audio_path: str) -> str:
+def transcribe_parakeet_mlx(
+    model_id: str,
+    mlx_model_id: str,
+    audio_path: str,
+    progress: bool,
+    chunk_seconds: float,
+) -> str:
     from parakeet_mlx import from_pretrained
 
     model = from_pretrained(mlx_model_id)
-    result = model.transcribe(audio_path)
+
+    if progress and chunk_seconds > 0:
+        next_percent = 0
+
+        def callback(current_position, total_position):
+            nonlocal next_percent
+            if total_position <= 0:
+                return
+            percent = int((float(current_position) / float(total_position)) * 100.0)
+            if percent >= next_percent:
+                print(f"[local-transcribe] progress={percent}%", file=sys.stderr)
+                next_percent = min(100, next_percent + 5)
+
+        result = model.transcribe(
+            audio_path,
+            chunk_duration=chunk_seconds,
+            chunk_callback=callback,
+        )
+    else:
+        result = model.transcribe(audio_path)
+
     return extract_text(getattr(result, "text", ""))
 
 
@@ -119,6 +145,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--result-path", required=True)
     parser.add_argument("--canary-max-new-tokens", type=int, default=256)
+    parser.add_argument("--mlx-chunk-seconds", type=float, default=120.0)
+    parser.add_argument("--transcribe-progress", action="store_true")
     return parser.parse_args()
 
 
@@ -138,7 +166,13 @@ def main() -> int:
 
     try:
         if args.runtime == "parakeet_mlx":
-            transcript = transcribe_parakeet_mlx(args.model_id, args.mlx_model_id, str(audio_path))
+            transcript = transcribe_parakeet_mlx(
+                args.model_id,
+                args.mlx_model_id,
+                str(audio_path),
+                args.transcribe_progress,
+                args.mlx_chunk_seconds,
+            )
         elif args.runtime == "parakeet_nemo":
             transcript = transcribe_parakeet(args.model_id, str(audio_path), device)
         else:

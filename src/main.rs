@@ -1,8 +1,9 @@
 use std::env;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -64,6 +65,14 @@ struct Cli {
     /// Disable yt-dlp download progress output.
     #[arg(long)]
     no_download_progress: bool,
+
+    /// Disable local transcription progress output.
+    #[arg(long)]
+    no_transcribe_progress: bool,
+
+    /// Chunk size in seconds used for MLX chunked transcription progress updates.
+    #[arg(long, default_value_t = 120.0)]
+    mlx_chunk_seconds: f32,
 
     /// Print subprocess commands before running.
     #[arg(long)]
@@ -169,6 +178,8 @@ struct LocalTranscriptionConfig<'a> {
     hf_token: Option<&'a str>,
     device: DeviceMode,
     canary_max_new_tokens: u16,
+    transcribe_progress: bool,
+    mlx_chunk_seconds: f32,
     print_command: bool,
 }
 
@@ -227,6 +238,7 @@ const MODELS: [ModelProfile; 2] = [
 ];
 
 fn main() -> Result<()> {
+    let total_started_at = Instant::now();
     let cli = Cli::parse();
 
     if let Some(command) = cli.command {
@@ -253,9 +265,16 @@ fn main() -> Result<()> {
     })?;
 
     stage(&format!("resolving video metadata for {url}"));
+    let metadata_started_at = Instant::now();
     let video_meta = fetch_video_metadata(url, &cli.yt_dlp_path, cli.print_command)?;
+    let metadata_duration = metadata_started_at.elapsed();
+    stage(&format!(
+        "video metadata resolved in {}",
+        format_duration(metadata_duration)
+    ));
 
     stage(&format!("downloading audio for model {}", model.id));
+    let download_started_at = Instant::now();
     let download_config = DownloadConfig {
         output_dir: &cli.output_dir,
         yt_dlp_path: &cli.yt_dlp_path,
@@ -264,11 +283,17 @@ fn main() -> Result<()> {
         no_download_progress: cli.no_download_progress,
     };
     let audio_path = download_audio(url, model, &video_meta, &download_config)?;
+    let download_duration = download_started_at.elapsed();
+    stage(&format!(
+        "audio downloaded in {}",
+        format_duration(download_duration)
+    ));
 
     stage(&format!(
         "transcribing locally with {} ({})",
         model.display_name, model.id
     ));
+    let transcribe_started_at = Instant::now();
     let local_transcription = transcribe_audio_local(
         &audio_path,
         model,
@@ -278,9 +303,16 @@ fn main() -> Result<()> {
             hf_token: cli.hf_token.as_deref(),
             device: cli.device,
             canary_max_new_tokens: cli.canary_max_new_tokens,
+            transcribe_progress: !cli.no_transcribe_progress,
+            mlx_chunk_seconds: cli.mlx_chunk_seconds,
             print_command: cli.print_command,
         },
     )?;
+    let transcribe_duration = transcribe_started_at.elapsed();
+    stage(&format!(
+        "transcription finished in {}",
+        format_duration(transcribe_duration)
+    ));
 
     if local_transcription.model_id != model.id {
         bail!(
@@ -296,23 +328,43 @@ fn main() -> Result<()> {
             .with_context(|| format!("failed to create `{}`", parent.display()))?;
     }
 
+    let write_started_at = Instant::now();
     fs::write(&transcript_path, local_transcription.transcript).with_context(|| {
         format!(
             "failed to write transcript to `{}`",
             transcript_path.display()
         )
     })?;
+    let write_duration = write_started_at.elapsed();
 
     if cli.delete_audio {
         fs::remove_file(&audio_path)
             .with_context(|| format!("failed to delete audio file `{}`", audio_path.display()))?;
     }
 
+    let total_duration = total_started_at.elapsed();
     stage("done");
     println!("audio_file={}", audio_path.display());
     println!("transcript_file={}", transcript_path.display());
     println!("device={}", local_transcription.device);
     println!("runtime={}", local_transcription.runtime);
+    println!("timing_metadata={}", format_duration(metadata_duration));
+    println!("timing_download={}", format_duration(download_duration));
+    println!(
+        "timing_transcription={}",
+        format_duration(transcribe_duration)
+    );
+    println!("timing_write={}", format_duration(write_duration));
+    println!("timing_total={}", format_duration(total_duration));
+    if let Some(audio_seconds) = try_wav_duration_seconds(&audio_path) {
+        println!("audio_duration={audio_seconds:.2}s");
+        if transcribe_duration.as_secs_f64() > 0.0 {
+            println!(
+                "transcription_speed={:.2}x_realtime",
+                audio_seconds / transcribe_duration.as_secs_f64()
+            );
+        }
+    }
 
     Ok(())
 }
@@ -612,10 +664,16 @@ fn run_local_runtime(
         .arg(&result_path)
         .arg("--canary-max-new-tokens")
         .arg(config.canary_max_new_tokens.to_string())
+        .arg("--mlx-chunk-seconds")
+        .arg(config.mlx_chunk_seconds.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .env("PYTORCH_ENABLE_MPS_FALLBACK", "1");
+
+    if config.transcribe_progress {
+        command.arg("--transcribe-progress");
+    }
 
     if let Some(mlx_model_id) = model.mlx_model_id {
         command.arg("--mlx-model-id").arg(mlx_model_id);
@@ -723,6 +781,69 @@ fn sanitize_filename(raw: &str) -> String {
 
 fn stage(message: &str) {
     eprintln!("[yt-transcript] {message}");
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.as_secs_f64() >= 1.0 {
+        return format!("{:.2}s", duration.as_secs_f64());
+    }
+
+    format!("{:.0}ms", duration.as_secs_f64() * 1000.0)
+}
+
+fn try_wav_duration_seconds(path: &Path) -> Option<f64> {
+    let mut file = fs::File::open(path).ok()?;
+
+    let mut riff = [0_u8; 12];
+    file.read_exact(&mut riff).ok()?;
+    if &riff[0..4] != b"RIFF" || &riff[8..12] != b"WAVE" {
+        return None;
+    }
+
+    let mut byte_rate: Option<u32> = None;
+    let mut data_size: Option<u32> = None;
+
+    loop {
+        let mut header = [0_u8; 8];
+        if file.read_exact(&mut header).is_err() {
+            break;
+        }
+
+        let chunk_id = &header[0..4];
+        let chunk_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        let chunk_size_u64 = u64::from(chunk_size);
+
+        if chunk_id == b"fmt " {
+            if chunk_size < 16 {
+                return None;
+            }
+            let mut fmt = vec![0_u8; chunk_size as usize];
+            file.read_exact(&mut fmt).ok()?;
+            byte_rate = Some(u32::from_le_bytes([fmt[8], fmt[9], fmt[10], fmt[11]]));
+        } else if chunk_id == b"data" {
+            data_size = Some(chunk_size);
+            file.seek(SeekFrom::Current(i64::try_from(chunk_size_u64).ok()?))
+                .ok()?;
+        } else {
+            file.seek(SeekFrom::Current(i64::try_from(chunk_size_u64).ok()?))
+                .ok()?;
+        }
+
+        if chunk_size % 2 == 1 {
+            file.seek(SeekFrom::Current(1)).ok()?;
+        }
+
+        if byte_rate.is_some() && data_size.is_some() {
+            break;
+        }
+    }
+
+    let byte_rate = byte_rate?;
+    let data_size = data_size?;
+    if byte_rate == 0 {
+        return None;
+    }
+    Some(f64::from(data_size) / f64::from(byte_rate))
 }
 
 fn render_command(command: &Command) -> String {

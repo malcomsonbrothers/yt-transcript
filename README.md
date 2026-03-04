@@ -73,6 +73,20 @@ yt-transcript models list
 - yt-dlp progress is shown by default
 - Stage logs are printed to stderr (`[yt-transcript] ...`)
 - Use `--no-download-progress` to hide yt-dlp progress
+- MLX runtime can print chunked progress updates (`[local-transcribe] progress=...%`)
+- Use `--no-transcribe-progress` to disable transcription progress logs
+
+## Timing output
+
+At the end of each run, the CLI prints:
+
+- `timing_metadata=...`
+- `timing_download=...`
+- `timing_transcription=...`
+- `timing_write=...`
+- `timing_total=...`
+- `audio_duration=...` (when WAV duration is available)
+- `transcription_speed=...x_realtime`
 
 ## Useful flags
 
@@ -82,3 +96,5 @@ yt-transcript models list
 - `--print-command`
 - `--python-version 3.12`
 - `--canary-max-new-tokens 256`
+- `--mlx-chunk-seconds 120`
+- `--no-transcribe-progress`
