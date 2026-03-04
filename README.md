@@ -26,6 +26,10 @@ Optional:
 cargo install --path .
 ```
 
+## Releasing
+
+For the full release + Homebrew tap flow, see [docs/RELEASING.md](docs/RELEASING.md).
+
 ## Usage
 
 Default model (Parakeet v3):
