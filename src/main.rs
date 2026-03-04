@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 
 const DEFAULT_MODEL_ID: &str = "nvidia/parakeet-tdt-0.6b-v3";
-const NEMO_TRANSCRIBE_SCRIPT: &str = include_str!("nemo_transcribe.py");
+const LOCAL_TRANSCRIBE_SCRIPT: &str = include_str!("nemo_transcribe.py");
 
 #[derive(Parser, Debug)]
 #[command(
@@ -94,6 +94,7 @@ enum ModelsCommands {
 
 #[derive(Debug, Clone, Copy)]
 enum ModelRuntime {
+    ParakeetMlx,
     ParakeetNemo,
     CanaryNemo,
 }
@@ -101,13 +102,30 @@ enum ModelRuntime {
 impl ModelRuntime {
     fn as_script_value(self) -> &'static str {
         match self {
+            Self::ParakeetMlx => "parakeet_mlx",
             Self::ParakeetNemo => "parakeet_nemo",
             Self::CanaryNemo => "canary_nemo",
         }
     }
 
+    fn short_name(self) -> &'static str {
+        match self {
+            Self::ParakeetMlx => "parakeet-mlx",
+            Self::ParakeetNemo => "parakeet-nemo",
+            Self::CanaryNemo => "canary-nemo",
+        }
+    }
+
+    fn dependency_packages(self) -> &'static [&'static str] {
+        match self {
+            Self::ParakeetMlx => &["parakeet-mlx"],
+            Self::ParakeetNemo | Self::CanaryNemo => &["torch", "nemo_toolkit[asr]"],
+        }
+    }
+
     fn description(self) -> &'static str {
         match self {
+            Self::ParakeetMlx => "local MLX runtime via `uv run --with parakeet-mlx`",
             Self::ParakeetNemo | Self::CanaryNemo => {
                 "local NeMo runtime via `uv run --with torch --with nemo_toolkit[asr]`"
             }
@@ -126,6 +144,7 @@ struct ModelProfile {
     sample_rate_hz: u32,
     channels: u8,
     runtime: ModelRuntime,
+    mlx_model_id: Option<&'static str>,
 }
 
 #[derive(Debug)]
@@ -158,6 +177,7 @@ struct LocalTranscriptionResult {
     transcript: String,
     device: String,
     model_id: String,
+    runtime: String,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -190,6 +210,7 @@ const MODELS: [ModelProfile; 2] = [
         sample_rate_hz: 16_000,
         channels: 1,
         runtime: ModelRuntime::ParakeetNemo,
+        mlx_model_id: Some("mlx-community/parakeet-tdt-0.6b-v3"),
     },
     ModelProfile {
         id: "nvidia/canary-qwen-2.5b",
@@ -201,6 +222,7 @@ const MODELS: [ModelProfile; 2] = [
         sample_rate_hz: 16_000,
         channels: 1,
         runtime: ModelRuntime::CanaryNemo,
+        mlx_model_id: None,
     },
 ];
 
@@ -290,6 +312,7 @@ fn main() -> Result<()> {
     println!("audio_file={}", audio_path.display());
     println!("transcript_file={}", transcript_path.display());
     println!("device={}", local_transcription.device);
+    println!("runtime={}", local_transcription.runtime);
 
     Ok(())
 }
@@ -332,8 +355,20 @@ fn print_models() {
         println!("  name: {}", model.display_name);
         println!("  notes: {}", model.notes);
         println!("  aliases: {}", model.aliases.join(", "));
-        println!("  runtime: {}", model.runtime.description());
+        println!("  runtime: {}", runtime_summary(&model));
         println!();
+    }
+}
+
+fn runtime_summary(model: &ModelProfile) -> String {
+    if cfg!(target_os = "macos") && model.mlx_model_id.is_some() {
+        format!(
+            "auto: {} -> {} fallback",
+            ModelRuntime::ParakeetMlx.description(),
+            ModelRuntime::ParakeetNemo.short_name(),
+        )
+    } else {
+        model.runtime.description().to_string()
     }
 }
 
@@ -503,6 +538,52 @@ fn transcribe_audio_local(
         bail!("audio file does not exist: `{}`", audio_path.display());
     }
 
+    let mut failures = Vec::new();
+    for runtime in runtime_candidates(model) {
+        stage(&format!(
+            "trying runtime {} ({})",
+            runtime.short_name(),
+            runtime.description()
+        ));
+
+        match run_local_runtime(audio_path, model, runtime, config) {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                failures.push(format!("{}: {error:#}", runtime.short_name()));
+                stage(&format!(
+                    "runtime {} failed, trying fallback if available",
+                    runtime.short_name()
+                ));
+            }
+        }
+    }
+
+    bail!(
+        "all local transcription runtimes failed: {}",
+        failures.join(" | ")
+    )
+}
+
+fn runtime_candidates(model: &ModelProfile) -> Vec<ModelRuntime> {
+    match model.runtime {
+        ModelRuntime::CanaryNemo => vec![ModelRuntime::CanaryNemo],
+        ModelRuntime::ParakeetMlx => vec![ModelRuntime::ParakeetMlx],
+        ModelRuntime::ParakeetNemo => {
+            if cfg!(target_os = "macos") && model.mlx_model_id.is_some() {
+                vec![ModelRuntime::ParakeetMlx, ModelRuntime::ParakeetNemo]
+            } else {
+                vec![ModelRuntime::ParakeetNemo]
+            }
+        }
+    }
+}
+
+fn run_local_runtime(
+    audio_path: &Path,
+    model: &ModelProfile,
+    runtime: ModelRuntime,
+    config: &LocalTranscriptionConfig<'_>,
+) -> Result<LocalTranscriptionResult> {
     let script_path = ensure_transcriber_script()?;
     let result_path = unique_result_path();
 
@@ -510,16 +591,17 @@ fn transcribe_audio_local(
     command
         .arg("run")
         .arg("--python")
-        .arg(config.python_version)
-        .arg("--with")
-        .arg("torch")
-        .arg("--with")
-        .arg("nemo_toolkit[asr]")
+        .arg(config.python_version);
+    for package in runtime.dependency_packages() {
+        command.arg("--with").arg(package);
+    }
+
+    command
         .arg("--")
         .arg("python")
         .arg(&script_path)
         .arg("--runtime")
-        .arg(model.runtime.as_script_value())
+        .arg(runtime.as_script_value())
         .arg("--model-id")
         .arg(model.id)
         .arg("--audio-path")
@@ -535,6 +617,10 @@ fn transcribe_audio_local(
         .stderr(Stdio::inherit())
         .env("PYTORCH_ENABLE_MPS_FALLBACK", "1");
 
+    if let Some(mlx_model_id) = model.mlx_model_id {
+        command.arg("--mlx-model-id").arg(mlx_model_id);
+    }
+
     if let Some(token) = config.hf_token {
         command.env("HF_TOKEN", token);
         command.env("HUGGING_FACE_HUB_TOKEN", token);
@@ -547,7 +633,6 @@ fn transcribe_audio_local(
     let status = command
         .status()
         .with_context(|| format!("failed to execute `{}`", config.uv_path))?;
-
     if !status.success() {
         bail!("local transcription runtime failed with status {status}");
     }
@@ -558,16 +643,13 @@ fn transcribe_audio_local(
             result_path.display()
         )
     })?;
-
     let result: LocalTranscriptionResult = serde_json::from_slice(&raw).with_context(|| {
         format!(
             "invalid transcription output JSON at `{}`",
             result_path.display()
         )
     })?;
-
     let _ = fs::remove_file(&result_path);
-
     Ok(result)
 }
 
@@ -576,14 +658,14 @@ fn ensure_transcriber_script() -> Result<PathBuf> {
     fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create temp directory `{}`", dir.display()))?;
 
-    let script_path = dir.join("nemo_transcribe.py");
+    let script_path = dir.join("local_transcribe.py");
     let should_write = match fs::read_to_string(&script_path) {
-        Ok(existing) => existing != NEMO_TRANSCRIBE_SCRIPT,
+        Ok(existing) => existing != LOCAL_TRANSCRIBE_SCRIPT,
         Err(_) => true,
     };
 
     if should_write {
-        fs::write(&script_path, NEMO_TRANSCRIBE_SCRIPT).with_context(|| {
+        fs::write(&script_path, LOCAL_TRANSCRIBE_SCRIPT).with_context(|| {
             format!(
                 "failed to write transcriber script `{}`",
                 script_path.display()

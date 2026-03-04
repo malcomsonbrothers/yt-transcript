@@ -5,8 +5,9 @@ Rust CLI that downloads model-compatible YouTube audio with `yt-dlp` and transcr
 ## Runtime model path
 
 - Local-only inference (no external transcription API calls).
-- Model runtime is invoked from Rust using:
-  - `uv run --with torch --with nemo_toolkit[asr]`
+- Runtime is selected automatically:
+  - Parakeet on macOS: tries MLX first (`uv run --with parakeet-mlx`), then falls back to NeMo.
+  - Canary: uses NeMo (`uv run --with torch --with nemo_toolkit[asr]`).
 - Missing model weights are downloaded automatically on first use and reused after that.
 
 ## Requirements
@@ -60,6 +61,7 @@ yt-transcript models list
   - `audio_file=...`
   - `transcript_file=...`
   - `device=...`
+  - `runtime=...`
 
 ## Caching
 
