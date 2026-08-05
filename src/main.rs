@@ -16,7 +16,7 @@ const LOCAL_TRANSCRIBE_SCRIPT: &str = include_str!("nemo_transcribe.py");
 #[command(
     name = "yt-transcript",
     version,
-    about = "Download YouTube audio and transcribe it locally with the selected model"
+    about = "Transcribe YouTube audio with Together AI by default, or use local runtimes with --local"
 )]
 struct Cli {
     /// YouTube video URL to download audio from.
@@ -53,6 +53,26 @@ struct Cli {
     /// Optional Hugging Face token for gated model downloads.
     #[arg(long, env = "HF_TOKEN")]
     hf_token: Option<String>,
+
+    /// Together AI API key for hosted transcription.
+    #[arg(long, env = "TOGETHER_API_KEY")]
+    together_api_key: Option<String>,
+
+    /// Use local runtimes only; otherwise Together AI is required.
+    #[arg(long)]
+    local: bool,
+
+    /// Request speaker diarisation from Together AI.
+    #[arg(long)]
+    diarize: bool,
+
+    /// Fix the requested minimum and maximum speaker count.
+    #[arg(long)]
+    speakers: Option<u8>,
+
+    /// Include segment timestamps in the transcript.
+    #[arg(long)]
+    timestamps: bool,
 
     /// Device selection for local inference.
     #[arg(long, value_enum, default_value_t = DeviceMode::Auto)]
@@ -101,8 +121,15 @@ enum ModelsCommands {
     List,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptionBackend {
+    TogetherCloud,
+    Local,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelRuntime {
+    TogetherCloud,
     ParakeetMlx,
     ParakeetNemo,
     CanaryNemo,
@@ -111,6 +138,7 @@ enum ModelRuntime {
 impl ModelRuntime {
     fn as_script_value(self) -> &'static str {
         match self {
+            Self::TogetherCloud => "together_cloud",
             Self::ParakeetMlx => "parakeet_mlx",
             Self::ParakeetNemo => "parakeet_nemo",
             Self::CanaryNemo => "canary_nemo",
@@ -119,6 +147,7 @@ impl ModelRuntime {
 
     fn short_name(self) -> &'static str {
         match self {
+            Self::TogetherCloud => "together",
             Self::ParakeetMlx => "parakeet-mlx",
             Self::ParakeetNemo => "parakeet-nemo",
             Self::CanaryNemo => "canary-nemo",
@@ -127,6 +156,7 @@ impl ModelRuntime {
 
     fn dependency_packages(self) -> &'static [&'static str] {
         match self {
+            Self::TogetherCloud => &[],
             Self::ParakeetMlx => &["parakeet-mlx"],
             Self::ParakeetNemo | Self::CanaryNemo => &["torch", "nemo_toolkit[asr]"],
         }
@@ -134,6 +164,7 @@ impl ModelRuntime {
 
     fn description(self) -> &'static str {
         match self {
+            Self::TogetherCloud => "Together AI hosted inference (no local GPU or Python)",
             Self::ParakeetMlx => "local MLX runtime via `uv run --with parakeet-mlx`",
             Self::ParakeetNemo | Self::CanaryNemo => {
                 "local NeMo runtime via `uv run --with torch --with nemo_toolkit[asr]`"
@@ -154,6 +185,7 @@ struct ModelProfile {
     channels: u8,
     runtime: ModelRuntime,
     mlx_model_id: Option<&'static str>,
+    together_model_id: Option<&'static str>,
 }
 
 #[derive(Debug)]
@@ -167,6 +199,7 @@ struct DownloadConfig<'a> {
     output_dir: &'a Path,
     yt_dlp_path: &'a str,
     ffmpeg_path: &'a str,
+    cloud_mode: bool,
     print_command: bool,
     no_download_progress: bool,
 }
@@ -174,6 +207,11 @@ struct DownloadConfig<'a> {
 #[derive(Debug)]
 struct LocalTranscriptionConfig<'a> {
     uv_path: &'a str,
+    together_api_key: Option<&'a str>,
+    force_local: bool,
+    diarize: bool,
+    speakers: Option<u8>,
+    timestamps: bool,
     python_version: &'a str,
     hf_token: Option<&'a str>,
     device: DeviceMode,
@@ -189,6 +227,32 @@ struct LocalTranscriptionResult {
     device: String,
     model_id: String,
     runtime: String,
+    #[serde(default)]
+    audio_duration_seconds: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TogetherTranscriptionResponse {
+    duration: f64,
+    text: String,
+    segments: Vec<TogetherSegment>,
+    #[serde(default)]
+    speaker_segments: Vec<TogetherSpeakerSegment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TogetherSegment {
+    text: String,
+    start: f64,
+    #[serde(alias = "speaker_id")]
+    speaker: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TogetherSpeakerSegment {
+    text: String,
+    start: f64,
+    speaker_id: String,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -222,6 +286,7 @@ const MODELS: [ModelProfile; 2] = [
         channels: 1,
         runtime: ModelRuntime::ParakeetNemo,
         mlx_model_id: Some("mlx-community/parakeet-tdt-0.6b-v3"),
+        together_model_id: Some("nvidia/parakeet-tdt-0.6b-v3"),
     },
     ModelProfile {
         id: "nvidia/canary-qwen-2.5b",
@@ -234,6 +299,7 @@ const MODELS: [ModelProfile; 2] = [
         channels: 1,
         runtime: ModelRuntime::CanaryNemo,
         mlx_model_id: None,
+        together_model_id: None,
     },
 ];
 
@@ -245,17 +311,24 @@ fn main() -> Result<()> {
         return handle_command(command);
     }
 
-    let url = cli
-        .url
+    let together_api_key = cli
+        .together_api_key
         .as_deref()
-        .context("a URL is required unless using a subcommand")?;
-
+        .filter(|key| !key.trim().is_empty());
     let model = resolve_model(&cli.model).ok_or_else(|| {
         anyhow!(
             "unknown model `{}`; run `yt-transcript models list`",
             cli.model
         )
     })?;
+    validate_transcription_options(&cli, model, together_api_key)?;
+
+    let url = cli
+        .url
+        .as_deref()
+        .context("a URL is required unless using a subcommand")?;
+    let backend = transcription_backend(cli.local);
+    let cloud_mode = backend == TranscriptionBackend::TogetherCloud;
 
     fs::create_dir_all(&cli.output_dir).with_context(|| {
         format!(
@@ -279,6 +352,7 @@ fn main() -> Result<()> {
         output_dir: &cli.output_dir,
         yt_dlp_path: &cli.yt_dlp_path,
         ffmpeg_path: &cli.ffmpeg_path,
+        cloud_mode,
         print_command: cli.print_command,
         no_download_progress: cli.no_download_progress,
     };
@@ -290,7 +364,7 @@ fn main() -> Result<()> {
     ));
 
     stage(&format!(
-        "transcribing locally with {} ({})",
+        "transcribing with {} ({})",
         model.display_name, model.id
     ));
     let transcribe_started_at = Instant::now();
@@ -299,6 +373,11 @@ fn main() -> Result<()> {
         model,
         &LocalTranscriptionConfig {
             uv_path: &cli.uv_path,
+            together_api_key,
+            force_local: cli.local,
+            diarize: cli.diarize,
+            speakers: cli.speakers,
+            timestamps: cli.timestamps,
             python_version: &cli.python_version,
             hf_token: cli.hf_token.as_deref(),
             device: cli.device,
@@ -328,6 +407,12 @@ fn main() -> Result<()> {
             .with_context(|| format!("failed to create `{}`", parent.display()))?;
     }
 
+    let audio_seconds = if cli.local {
+        try_wav_duration_seconds(&audio_path)
+    } else {
+        local_transcription.audio_duration_seconds
+    };
+
     let write_started_at = Instant::now();
     fs::write(&transcript_path, local_transcription.transcript).with_context(|| {
         format!(
@@ -338,8 +423,7 @@ fn main() -> Result<()> {
     let write_duration = write_started_at.elapsed();
 
     if cli.delete_audio {
-        fs::remove_file(&audio_path)
-            .with_context(|| format!("failed to delete audio file `{}`", audio_path.display()))?;
+        remove_audio_file(&audio_path)?;
     }
 
     let total_duration = total_started_at.elapsed();
@@ -356,7 +440,7 @@ fn main() -> Result<()> {
     );
     println!("timing_write={}", format_duration(write_duration));
     println!("timing_total={}", format_duration(total_duration));
-    if let Some(audio_seconds) = try_wav_duration_seconds(&audio_path) {
+    if let Some(audio_seconds) = audio_seconds {
         println!("audio_duration={audio_seconds:.2}s");
         if transcribe_duration.as_secs_f64() > 0.0 {
             println!(
@@ -367,6 +451,47 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_transcription_options(
+    cli: &Cli,
+    model: &ModelProfile,
+    together_api_key: Option<&str>,
+) -> Result<()> {
+    let diarisation_requested = cli.diarize || cli.speakers.is_some();
+    if diarisation_requested && cli.local {
+        bail!(
+            "diarisation is only available with Together AI; remove `--local` and set TOGETHER_API_KEY"
+        );
+    }
+    if diarisation_requested && model.together_model_id.is_none() {
+        bail!(
+            "diarisation is unavailable for model `{}` because it is not hosted by Together AI; choose a hosted model",
+            model.id
+        );
+    }
+    if diarisation_requested && together_api_key.is_none() {
+        bail!(
+            "diarisation requires the Together cloud backend; set TOGETHER_API_KEY or remove the diarisation options and pass `--local`"
+        );
+    }
+    if !cli.local && model.together_model_id.is_none() {
+        bail!(
+            "model `{}` is local-only; pass `--local` to use it",
+            model.id
+        );
+    }
+    if !cli.local && together_api_key.is_none() {
+        bail!(
+            "Together AI cloud transcription requires TOGETHER_API_KEY; set it or pass `--local` to transcribe locally"
+        );
+    }
+    Ok(())
+}
+
+fn remove_audio_file(path: &Path) -> Result<()> {
+    fs::remove_file(path)
+        .with_context(|| format!("failed to delete audio file `{}`", path.display()))
 }
 
 fn handle_command(command: Commands) -> Result<()> {
@@ -413,14 +538,23 @@ fn print_models() {
 }
 
 fn runtime_summary(model: &ModelProfile) -> String {
-    if cfg!(target_os = "macos") && model.mlx_model_id.is_some() {
+    let local_summary = if cfg!(target_os = "macos") && model.mlx_model_id.is_some() {
         format!(
-            "auto: {} -> {} fallback",
+            "{} -> {} fallback",
             ModelRuntime::ParakeetMlx.description(),
             ModelRuntime::ParakeetNemo.short_name(),
         )
     } else {
         model.runtime.description().to_string()
+    };
+
+    if model.together_model_id.is_some() {
+        format!(
+            "default: {} (requires TOGETHER_API_KEY); --local: {local_summary}",
+            ModelRuntime::TogetherCloud.description()
+        )
+    } else {
+        format!("local-only (requires --local): {local_summary}")
     }
 }
 
@@ -487,43 +621,58 @@ fn download_audio(
         .output_dir
         .join(format!("{base_name}.{}", model.output_format));
 
-    let postprocessor_args = format!(
-        "ffmpeg:-ac {} -ar {} -sample_fmt s16",
-        model.channels, model.sample_rate_hz
-    );
+    let mut command = Command::new(config.yt_dlp_path);
+    command.arg("--no-playlist");
 
-    let ffmpeg_location = resolve_executable_path(config.ffmpeg_path);
-    let ffmpeg_arg_is_path = Path::new(config.ffmpeg_path).components().count() > 1;
-
-    if ffmpeg_arg_is_path && ffmpeg_location.is_none() {
-        bail!(
-            "ffmpeg path `{}` does not exist or is not executable",
-            config.ffmpeg_path
+    if config.cloud_mode {
+        command.arg("-f").arg("bestaudio");
+    } else {
+        let postprocessor_args = format!(
+            "ffmpeg:-ac {} -ar {} -sample_fmt s16",
+            model.channels, model.sample_rate_hz
         );
+        let ffmpeg_location = resolve_executable_path(config.ffmpeg_path);
+        let ffmpeg_arg_is_path = Path::new(config.ffmpeg_path).components().count() > 1;
+
+        if ffmpeg_arg_is_path && ffmpeg_location.is_none() {
+            bail!(
+                "ffmpeg path `{}` does not exist or is not executable",
+                config.ffmpeg_path
+            );
+        }
+
+        command
+            .arg("--extract-audio")
+            .arg("--audio-format")
+            .arg(model.output_format)
+            .arg("--audio-quality")
+            .arg("0")
+            .arg("--postprocessor-args")
+            .arg(postprocessor_args)
+            .arg("-f")
+            .arg(model.yt_dlp_format);
+
+        if let Some(path) = ffmpeg_location {
+            command.arg("--ffmpeg-location").arg(path);
+        }
     }
 
-    let mut command = Command::new(config.yt_dlp_path);
+    let downloaded_path_report = config.cloud_mode.then(unique_downloaded_path_report);
+    if let Some(report_path) = &downloaded_path_report {
+        command
+            .arg("--print-to-file")
+            .arg("after_move:%(filepath)s")
+            .arg(report_path)
+            .arg("--no-simulate");
+    }
+
     command
-        .arg("--no-playlist")
-        .arg("--extract-audio")
-        .arg("--audio-format")
-        .arg(model.output_format)
-        .arg("--audio-quality")
-        .arg("0")
-        .arg("--postprocessor-args")
-        .arg(postprocessor_args)
-        .arg("-f")
-        .arg(model.yt_dlp_format)
         .arg("-o")
         .arg(output_template)
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-
-    if let Some(path) = ffmpeg_location {
-        command.arg("--ffmpeg-location").arg(path);
-    }
 
     if config.no_download_progress {
         command.arg("--no-progress");
@@ -538,7 +687,14 @@ fn download_audio(
         .with_context(|| format!("failed to execute `{}`", config.yt_dlp_path))?;
 
     if !status.success() {
+        if let Some(report_path) = &downloaded_path_report {
+            let _ = fs::remove_file(report_path);
+        }
         bail!("yt-dlp download failed with status {status}");
+    }
+
+    if let Some(report_path) = downloaded_path_report {
+        return discover_downloaded_audio(&report_path, &base_name);
     }
 
     if !output_audio.exists() {
@@ -549,6 +705,52 @@ fn download_audio(
     }
 
     Ok(output_audio)
+}
+
+fn discover_downloaded_audio(report_path: &Path, base_name: &str) -> Result<PathBuf> {
+    const AUDIO_EXTENSIONS: &[&str] = &["wav", "mp3", "m4a", "webm", "flac", "ogg", "opus", "aac"];
+
+    let reported = fs::read_to_string(report_path).with_context(|| {
+        format!(
+            "yt-dlp did not report the downloaded audio path in `{}`",
+            report_path.display()
+        )
+    });
+    let _ = fs::remove_file(report_path);
+    let reported = reported?;
+    let path = reported
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .map(PathBuf::from)
+        .with_context(|| format!("yt-dlp did not produce an audio file for `{base_name}`"))?;
+    let supported = path.file_stem().and_then(|stem| stem.to_str()) == Some(base_name)
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                AUDIO_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+            });
+
+    if !supported || !path.is_file() {
+        bail!(
+            "yt-dlp did not produce a supported audio file for `{base_name}` (reported `{}`)",
+            path.display()
+        );
+    }
+
+    Ok(path)
+}
+
+fn unique_downloaded_path_report() -> PathBuf {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+
+    env::temp_dir().join(format!("yt-transcript-download-{pid}-{nanos}.txt"))
 }
 
 fn resolve_executable_path(tool: &str) -> Option<PathBuf> {
@@ -590,6 +792,18 @@ fn transcribe_audio_local(
         bail!("audio file does not exist: `{}`", audio_path.display());
     }
 
+    if transcription_backend(config.force_local) == TranscriptionBackend::TogetherCloud {
+        let runtime = ModelRuntime::TogetherCloud;
+        stage(&format!(
+            "trying runtime {} ({})",
+            runtime.short_name(),
+            runtime.description()
+        ));
+        return run_together_runtime(audio_path, model, config).with_context(
+            || "Together cloud transcription failed; pass `--local` to transcribe locally",
+        );
+    }
+
     let mut failures = Vec::new();
     for runtime in runtime_candidates(model) {
         stage(&format!(
@@ -603,7 +817,7 @@ fn transcribe_audio_local(
             Err(error) => {
                 failures.push(format!("{}: {error:#}", runtime.short_name()));
                 stage(&format!(
-                    "runtime {} failed, trying fallback if available",
+                    "runtime {} failed, trying local fallback if available",
                     runtime.short_name()
                 ));
             }
@@ -616,8 +830,17 @@ fn transcribe_audio_local(
     )
 }
 
+fn transcription_backend(local: bool) -> TranscriptionBackend {
+    if local {
+        TranscriptionBackend::Local
+    } else {
+        TranscriptionBackend::TogetherCloud
+    }
+}
+
 fn runtime_candidates(model: &ModelProfile) -> Vec<ModelRuntime> {
     match model.runtime {
+        ModelRuntime::TogetherCloud => Vec::new(),
         ModelRuntime::CanaryNemo => vec![ModelRuntime::CanaryNemo],
         ModelRuntime::ParakeetMlx => vec![ModelRuntime::ParakeetMlx],
         ModelRuntime::ParakeetNemo => {
@@ -630,12 +853,154 @@ fn runtime_candidates(model: &ModelProfile) -> Vec<ModelRuntime> {
     }
 }
 
+fn run_together_runtime(
+    audio_path: &Path,
+    model: &ModelProfile,
+    config: &LocalTranscriptionConfig<'_>,
+) -> Result<LocalTranscriptionResult> {
+    const MAX_UPLOAD_BYTES: u64 = 500_000_000;
+    const ENDPOINT: &str = "https://api.together.ai/v1/audio/transcriptions";
+
+    let api_key = config
+        .together_api_key
+        .context("Together cloud runtime requires TOGETHER_API_KEY")?;
+    let together_model_id = model
+        .together_model_id
+        .context("the selected model is not available on Together AI")?;
+    let metadata = fs::metadata(audio_path)
+        .with_context(|| format!("failed to inspect audio file `{}`", audio_path.display()))?;
+    if metadata.len() > MAX_UPLOAD_BYTES {
+        bail!(
+            "audio file `{}` is too large for Together AI's 500 MB direct upload limit",
+            audio_path.display()
+        );
+    }
+
+    let file = fs::File::open(audio_path)
+        .with_context(|| format!("failed to open audio file `{}`", audio_path.display()))?;
+    let file_name = audio_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("audio")
+        .to_string();
+    let file_part = reqwest::blocking::multipart::Part::reader(file).file_name(file_name);
+    let diarise = config.diarize || config.speakers.is_some();
+    let mut form = reqwest::blocking::multipart::Form::new()
+        .part("file", file_part)
+        .text("model", together_model_id.to_string())
+        .text("language", "en")
+        .text("response_format", "verbose_json");
+    if diarise {
+        form = form.text("diarize", "true");
+    }
+    if let Some(speakers) = config.speakers {
+        let speakers = speakers.to_string();
+        form = form
+            .text("min_speakers", speakers.clone())
+            .text("max_speakers", speakers);
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30 * 60))
+        .build()
+        .context("failed to initialise Together AI HTTP client")?;
+    let response = client
+        .post(ENDPOINT)
+        .bearer_auth(api_key)
+        .multipart(form)
+        .send()
+        .context("Together AI transcription request failed")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .context("failed to read Together AI response body")?;
+    if !status.is_success() {
+        let readable_body: String = body.chars().take(2_000).collect();
+        bail!("Together AI returned HTTP {status}: {readable_body}");
+    }
+
+    let response: TogetherTranscriptionResponse =
+        serde_json::from_str(&body).context("invalid Together AI transcription response JSON")?;
+    let transcript = format_together_transcript(&response, config.timestamps, diarise);
+
+    Ok(LocalTranscriptionResult {
+        transcript,
+        device: "together-cloud".into(),
+        model_id: together_model_id.to_string(),
+        runtime: "together_cloud".into(),
+        audio_duration_seconds: Some(response.duration),
+    })
+}
+
+fn format_together_transcript(
+    response: &TogetherTranscriptionResponse,
+    timestamps: bool,
+    diarise: bool,
+) -> String {
+    if !timestamps && !diarise {
+        return response.text.clone();
+    }
+
+    if diarise && !response.speaker_segments.is_empty() {
+        return response
+            .speaker_segments
+            .iter()
+            .map(|segment| {
+                format_together_segment(
+                    &segment.text,
+                    segment.start,
+                    timestamps,
+                    Some(&segment.speaker_id),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    response
+        .segments
+        .iter()
+        .map(|segment| {
+            let speaker = diarise.then(|| segment.speaker.as_deref().unwrap_or("UNKNOWN_SPEAKER"));
+            format_together_segment(&segment.text, segment.start, timestamps, speaker)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_together_segment(
+    text: &str,
+    start: f64,
+    timestamps: bool,
+    speaker: Option<&str>,
+) -> String {
+    let text = text.trim();
+    match (timestamps, speaker) {
+        (true, Some(speaker)) => format!("[{}] {speaker} {text}", format_timestamp(start)),
+        (true, None) => format!("[{}] {text}", format_timestamp(start)),
+        (false, Some(speaker)) => format!("{speaker} {text}"),
+        (false, None) => text.to_string(),
+    }
+}
+
+fn format_timestamp(seconds: f64) -> String {
+    let total_seconds = seconds.max(0.0).floor() as u64;
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
 fn run_local_runtime(
     audio_path: &Path,
     model: &ModelProfile,
     runtime: ModelRuntime,
     config: &LocalTranscriptionConfig<'_>,
 ) -> Result<LocalTranscriptionResult> {
+    if matches!(runtime, ModelRuntime::TogetherCloud) {
+        bail!("Together cloud runtime cannot be launched through the local Python runner");
+    }
+
     let script_path = ensure_transcriber_script()?;
     let result_path = unique_result_path();
 
@@ -905,5 +1270,64 @@ mod tests {
     fn sanitizes_filename_to_ascii_safe() {
         let out = sanitize_filename("Hello, world! (v2)");
         assert_eq!(out, "Hello_world_v2");
+    }
+
+    #[test]
+    fn formats_together_segments_with_timestamps_and_diarisation() {
+        let response = TogetherTranscriptionResponse {
+            duration: 65.5,
+            text: "Plain transcript".to_string(),
+            segments: vec![
+                TogetherSegment {
+                    text: " First line ".to_string(),
+                    start: 1.9,
+                    speaker: Some("SPEAKER_0".to_string()),
+                },
+                TogetherSegment {
+                    text: "Second line".to_string(),
+                    start: 65.2,
+                    speaker: Some("SPEAKER_1".to_string()),
+                },
+            ],
+            speaker_segments: Vec::new(),
+        };
+
+        assert_eq!(
+            format_together_transcript(&response, true, true),
+            "[00:00:01] SPEAKER_0 First line\n[00:01:05] SPEAKER_1 Second line"
+        );
+        assert_eq!(
+            format_together_transcript(&response, false, true),
+            "SPEAKER_0 First line\nSPEAKER_1 Second line"
+        );
+        assert_eq!(
+            format_together_transcript(&response, false, false),
+            "Plain transcript"
+        );
+    }
+
+    #[test]
+    fn local_flag_selects_the_exclusive_transcription_backend() {
+        assert_eq!(
+            transcription_backend(false),
+            TranscriptionBackend::TogetherCloud
+        );
+        assert_eq!(transcription_backend(true), TranscriptionBackend::Local);
+
+        let model = resolve_model(DEFAULT_MODEL_ID).expect("default model should resolve");
+        assert!(
+            runtime_candidates(model)
+                .iter()
+                .all(|runtime| *runtime != ModelRuntime::TogetherCloud)
+        );
+    }
+
+    #[test]
+    fn models_list_works_when_diarize_flag_is_present() {
+        let cli = Cli::try_parse_from(["yt-transcript", "--diarize", "models", "list"])
+            .expect("CLI arguments should parse");
+        assert!(cli.diarize);
+        let command = cli.command.expect("models subcommand should be present");
+        assert!(handle_command(command).is_ok());
     }
 }
