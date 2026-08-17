@@ -12,6 +12,15 @@ use serde::Deserialize;
 const DEFAULT_MODEL_ID: &str = "nvidia/parakeet-tdt-0.6b-v3";
 const LOCAL_TRANSCRIBE_SCRIPT: &str = include_str!("nemo_transcribe.py");
 
+/// Together AI rejects direct uploads above 80 MB. Oversized audio is re-encoded
+/// rather than refused; see `shrink_for_upload`.
+const MAX_UPLOAD_BYTES: u64 = 80_000_000;
+/// Parakeet resamples to 16 kHz mono, so a 16 kHz mono Opus stream discards only
+/// what the model never receives. 32 kbps keeps Together's 4-hour ceiling under
+/// 60 MB, so one re-encode is always enough.
+const UPLOAD_SHRINK_SAMPLE_RATE: &str = "16000";
+const UPLOAD_SHRINK_BITRATE: &str = "32k";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "yt-transcript",
@@ -207,6 +216,7 @@ struct DownloadConfig<'a> {
 #[derive(Debug)]
 struct LocalTranscriptionConfig<'a> {
     uv_path: &'a str,
+    ffmpeg_path: &'a str,
     together_api_key: Option<&'a str>,
     force_local: bool,
     diarize: bool,
@@ -373,6 +383,7 @@ fn main() -> Result<()> {
         model,
         &LocalTranscriptionConfig {
             uv_path: &cli.uv_path,
+            ffmpeg_path: &cli.ffmpeg_path,
             together_api_key,
             force_local: cli.local,
             diarize: cli.diarize,
@@ -858,7 +869,6 @@ fn run_together_runtime(
     model: &ModelProfile,
     config: &LocalTranscriptionConfig<'_>,
 ) -> Result<LocalTranscriptionResult> {
-    const MAX_UPLOAD_BYTES: u64 = 500_000_000;
     const ENDPOINT: &str = "https://api.together.ai/v1/audio/transcriptions";
 
     let api_key = config
@@ -869,24 +879,26 @@ fn run_together_runtime(
         .context("the selected model is not available on Together AI")?;
     let metadata = fs::metadata(audio_path)
         .with_context(|| format!("failed to inspect audio file `{}`", audio_path.display()))?;
-    if metadata.len() > MAX_UPLOAD_BYTES {
-        bail!(
-            "audio file `{}` is too large for Together AI's 500 MB direct upload limit",
-            audio_path.display()
-        );
-    }
 
-    let file = fs::File::open(audio_path)
-        .with_context(|| format!("failed to open audio file `{}`", audio_path.display()))?;
-    let file_name = audio_path
+    // Files over the limit are re-encoded to a speech-grade stream rather than
+    // rejected. `_shrunk` keeps the temporary file alive for the whole request.
+    let _shrunk = (metadata.len() > MAX_UPLOAD_BYTES)
+        .then(|| shrink_for_upload(audio_path, metadata.len(), config))
+        .transpose()?;
+    let upload_path = _shrunk.as_ref().map_or(audio_path, |file| file.path());
+
+    let file = fs::File::open(upload_path)
+        .with_context(|| format!("failed to open audio file `{}`", upload_path.display()))?;
+    let file_name = upload_path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("audio")
         .to_string();
     let file_part = reqwest::blocking::multipart::Part::reader(file).file_name(file_name);
     let diarise = config.diarize || config.speakers.is_some();
+    // Together rejects the request unless `model` arrives before the audio part,
+    // and reports that ordering failure as HTTP 413. Keep `.text("model", ..)` first.
     let mut form = reqwest::blocking::multipart::Form::new()
-        .part("file", file_part)
         .text("model", together_model_id.to_string())
         .text("language", "en")
         .text("response_format", "verbose_json");
@@ -899,6 +911,7 @@ fn run_together_runtime(
             .text("min_speakers", speakers.clone())
             .text("max_speakers", speakers);
     }
+    let form = form.part("file", file_part);
 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30 * 60))
@@ -930,6 +943,119 @@ fn run_together_runtime(
         runtime: "together_cloud".into(),
         audio_duration_seconds: Some(response.duration),
     })
+}
+
+/// A temporary file removed when dropped.
+struct TempAudio {
+    path: PathBuf,
+}
+
+impl TempAudio {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempAudio {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Re-encode oversized audio to 16 kHz mono Opus so it fits Together's upload
+/// limit. Lossy, but only below what the model can hear.
+fn shrink_for_upload(
+    audio_path: &Path,
+    original_bytes: u64,
+    config: &LocalTranscriptionConfig<'_>,
+) -> Result<TempAudio> {
+    let ffmpeg = resolve_executable_path(config.ffmpeg_path).ok_or_else(|| {
+        anyhow!(
+            "audio file `{}` is {} but Together AI accepts at most {}; \
+             re-encoding needs ffmpeg on your PATH (or pass `--ffmpeg-path`)",
+            audio_path.display(),
+            format_megabytes(original_bytes),
+            format_megabytes(MAX_UPLOAD_BYTES)
+        )
+    })?;
+
+    stage(&format!(
+        "audio is {} (over Together's {} limit); re-encoding to {} kHz mono Opus",
+        format_megabytes(original_bytes),
+        format_megabytes(MAX_UPLOAD_BYTES),
+        UPLOAD_SHRINK_SAMPLE_RATE
+    ));
+
+    let output = TempAudio {
+        path: unique_shrunk_audio_path(),
+    };
+    let mut command = Command::new(&ffmpeg);
+    command
+        .arg("-y")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-i")
+        .arg(audio_path)
+        .arg("-vn")
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg(UPLOAD_SHRINK_SAMPLE_RATE)
+        .arg("-c:a")
+        .arg("libopus")
+        .arg("-b:a")
+        .arg(UPLOAD_SHRINK_BITRATE)
+        .arg(output.path())
+        .stdin(Stdio::null());
+    if config.print_command {
+        stage(&format!("running {command:?}"));
+    }
+
+    let status = command
+        .status()
+        .with_context(|| format!("failed to run ffmpeg at `{}`", ffmpeg.display()))?;
+    if !status.success() {
+        bail!("ffmpeg failed to re-encode `{}`", audio_path.display());
+    }
+
+    let shrunk_bytes = fs::metadata(output.path())
+        .with_context(|| format!("failed to inspect `{}`", output.path().display()))?
+        .len();
+    if shrunk_bytes > MAX_UPLOAD_BYTES {
+        bail!(
+            "re-encoded audio is still {} (limit {}); the recording likely exceeds \
+             Together AI's 4-hour ceiling, so split it and transcribe each part",
+            format_megabytes(shrunk_bytes),
+            format_megabytes(MAX_UPLOAD_BYTES)
+        );
+    }
+
+    stage(&format!(
+        "re-encoded to {} ({} smaller)",
+        format_megabytes(shrunk_bytes),
+        format_shrink_ratio(original_bytes, shrunk_bytes)
+    ));
+    Ok(output)
+}
+
+fn unique_shrunk_audio_path() -> PathBuf {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    env::temp_dir().join(format!("yt-transcript-upload-{pid}-{nanos}.opus"))
+}
+
+fn format_megabytes(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+}
+
+fn format_shrink_ratio(original: u64, shrunk: u64) -> String {
+    if shrunk == 0 {
+        return "unknown".into();
+    }
+    format!("{:.1}x", original as f64 / shrunk as f64)
 }
 
 fn format_together_transcript(
@@ -1329,5 +1455,47 @@ mod tests {
         assert!(cli.diarize);
         let command = cli.command.expect("models subcommand should be present");
         assert!(handle_command(command).is_ok());
+    }
+
+    #[test]
+    fn upload_limit_matches_together_direct_upload_ceiling() {
+        assert_eq!(MAX_UPLOAD_BYTES, 80_000_000);
+    }
+
+    #[test]
+    fn shrink_settings_keep_four_hours_under_the_upload_limit() {
+        // Together caps a single request at 4 hours of audio. Confirm the chosen
+        // bitrate keeps even that worst case comfortably inside the byte limit,
+        // so `shrink_for_upload` never needs a second pass.
+        let bitrate_bits_per_second: u64 = 32_000;
+        let four_hours_seconds: u64 = 4 * 60 * 60;
+        let worst_case_bytes = bitrate_bits_per_second / 8 * four_hours_seconds;
+        assert!(
+            worst_case_bytes < MAX_UPLOAD_BYTES,
+            "4h at {UPLOAD_SHRINK_BITRATE} is {worst_case_bytes} bytes, over the limit"
+        );
+    }
+
+    #[test]
+    fn shrink_sample_rate_matches_the_model_input_rate() {
+        // Parakeet resamples to 16 kHz, so re-encoding above that only adds bytes.
+        assert_eq!(UPLOAD_SHRINK_SAMPLE_RATE, "16000");
+    }
+
+    #[test]
+    fn formats_sizes_and_ratios_for_stage_logs() {
+        assert_eq!(format_megabytes(80_000_000), "80.0 MB");
+        assert_eq!(format_megabytes(0), "0.0 MB");
+        assert_eq!(format_shrink_ratio(100_000_000, 25_000_000), "4.0x");
+        assert_eq!(format_shrink_ratio(100, 0), "unknown");
+    }
+
+    #[test]
+    fn temp_audio_is_removed_on_drop() {
+        let path = unique_shrunk_audio_path();
+        fs::write(&path, b"placeholder").expect("temp file should be writable");
+        assert!(path.is_file());
+        drop(TempAudio { path: path.clone() });
+        assert!(!path.exists(), "TempAudio should delete its file on drop");
     }
 }

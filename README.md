@@ -21,6 +21,7 @@ Every run that transcribes a video requires:
 Cloud transcription (the default) requires:
 
 - `TOGETHER_API_KEY` (or pass `--together-api-key`)
+- `ffmpeg` on your `PATH` (or pass `--ffmpeg-path`), only when the audio exceeds the 80 MB upload limit and must be re-encoded
 
 Local transcription with `--local` also requires:
 
@@ -84,7 +85,9 @@ yt-transcript models list
 
 The default path uploads downloaded audio to Together AI, a third-party service. Use `--local` if the audio must not leave your machine.
 
-Together AI accepts at most 500 MB per upload and 4 hours of audio per transcription request.
+Together AI accepts at most 80 MB per upload and 4 hours of audio per transcription request.
+
+Audio over 80 MB is re-encoded to 16 kHz mono Opus before upload instead of being rejected. Parakeet resamples to 16 kHz mono anyway, so this discards only what the model never receives. Re-encoding needs `ffmpeg` on your `PATH` (or `--ffmpeg-path`). Recordings longer than 4 hours still have to be split by hand.
 
 ## Device behaviour
 
