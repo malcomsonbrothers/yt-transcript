@@ -21,7 +21,7 @@ Every run that transcribes a video requires:
 Cloud transcription (the default) requires:
 
 - `TOGETHER_API_KEY` (or pass `--together-api-key`)
-- `ffmpeg` on your `PATH` (or pass `--ffmpeg-path`), only when the audio exceeds the 80 MB upload limit and must be re-encoded
+- `ffmpeg` on your `PATH` (or pass `--ffmpeg-path`); it extracts the audio track, and re-encodes first when the audio exceeds the 80 MB upload limit
 
 Local transcription with `--local` also requires:
 
@@ -100,9 +100,11 @@ These options apply only with `--local`:
 
 ## Output
 
-- Cloud mode downloads the best audio stream in its source container and uploads it as-is: `<safe-title>-<video-id>.<source-extension>`
+- Cloud mode downloads the audio track in its source container and uploads it as-is: `<safe-title>-<video-id>.<source-extension>`
+  - Sites that publish muxed streams only (Dailymotion, for example) fall back to the best combined stream and have its audio track extracted without re-encoding
 - Local mode converts audio to mono 16 kHz WAV: `<safe-title>-<video-id>.wav`
 - Writes transcript text: `<safe-title>-<video-id>.txt`
+- With `--keep-video`, also keeps the full video: `<safe-title>-<video-id>-video.mp4`
 - Prints:
   - `audio_file=...`
   - `transcript_file=...`
@@ -151,6 +153,7 @@ Output and progress:
 - `--output-dir ./out`
 - `--transcript-path ./out/transcript.txt`
 - `--delete-audio`
+- `--keep-video`
 - `--print-command`
 - `--no-download-progress`
 

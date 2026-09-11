@@ -111,6 +111,10 @@ struct Cli {
     #[arg(long)]
     delete_audio: bool,
 
+    /// Also download and keep the full video next to the audio.
+    #[arg(long)]
+    keep_video: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -373,6 +377,21 @@ fn main() -> Result<()> {
         format_duration(download_duration)
     ));
 
+    let video_path = if cli.keep_video {
+        stage("downloading video to keep");
+        let video_started_at = Instant::now();
+        let path = download_video(url, &video_meta, &download_config)?;
+        let video_bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        stage(&format!(
+            "video downloaded in {} ({})",
+            format_duration(video_started_at.elapsed()),
+            format_megabytes(video_bytes)
+        ));
+        Some(path)
+    } else {
+        None
+    };
+
     stage(&format!(
         "transcribing with {} ({})",
         model.display_name, model.id
@@ -440,6 +459,9 @@ fn main() -> Result<()> {
     let total_duration = total_started_at.elapsed();
     stage("done");
     println!("audio_file={}", audio_path.display());
+    if let Some(video_path) = &video_path {
+        println!("video_file={}", video_path.display());
+    }
     println!("transcript_file={}", transcript_path.display());
     println!("device={}", local_transcription.device);
     println!("runtime={}", local_transcription.runtime);
@@ -620,6 +642,153 @@ fn fetch_video_metadata(url: &str, yt_dlp_path: &str, print_command: bool) -> Re
     })
 }
 
+/// Resolve the ffmpeg binary, failing early when an explicit path is wrong.
+fn resolve_ffmpeg_location(ffmpeg_path: &str) -> Result<Option<PathBuf>> {
+    let location = resolve_executable_path(ffmpeg_path);
+    let arg_is_path = Path::new(ffmpeg_path).components().count() > 1;
+
+    if arg_is_path && location.is_none() {
+        bail!("ffmpeg path `{ffmpeg_path}` does not exist or is not executable");
+    }
+
+    Ok(location)
+}
+
+/// yt-dlp arguments for the file that gets transcribed.
+///
+/// Cloud mode uploads the source container as-is, so it only needs an audio
+/// track. Some sites publish muxed streams only (Dailymotion, for example), so
+/// the selector falls back to `best` and `--extract-audio` splits the audio
+/// track out. `--audio-format best` keeps the source codec, which makes that
+/// fallback a remux rather than a re-encode.
+fn audio_download_args(
+    model: &ModelProfile,
+    cloud_mode: bool,
+    ffmpeg_path: &str,
+) -> Result<Vec<String>> {
+    let mut args: Vec<String> = vec!["--no-playlist".to_string()];
+
+    if cloud_mode {
+        args.extend(
+            [
+                "--extract-audio",
+                "--audio-format",
+                "best",
+                "-f",
+                "bestaudio/best",
+            ]
+            .map(str::to_string),
+        );
+    } else {
+        let postprocessor_args = format!(
+            "ffmpeg:-ac {} -ar {} -sample_fmt s16",
+            model.channels, model.sample_rate_hz
+        );
+        args.extend(
+            [
+                "--extract-audio",
+                "--audio-format",
+                model.output_format,
+                "--audio-quality",
+                "0",
+                "--postprocessor-args",
+                postprocessor_args.as_str(),
+                "-f",
+                model.yt_dlp_format,
+            ]
+            .map(str::to_string),
+        );
+    }
+
+    if let Some(path) = resolve_ffmpeg_location(ffmpeg_path)? {
+        args.push("--ffmpeg-location".to_string());
+        args.push(path.display().to_string());
+    }
+
+    Ok(args)
+}
+
+/// yt-dlp arguments for the optional kept video.
+///
+/// `bestvideo*+bestaudio/best` prefers separate streams and falls back to a
+/// single muxed one on sites that only publish that. Merging to MP4 keeps the
+/// container predictable across sites.
+fn video_download_args() -> [&'static str; 5] {
+    [
+        "--no-playlist",
+        "--merge-output-format",
+        "mp4",
+        "-f",
+        "bestvideo*+bestaudio/best",
+    ]
+}
+
+/// Download the full video so the source media survives next to the transcript.
+fn download_video(url: &str, meta: &VideoMeta, config: &DownloadConfig<'_>) -> Result<PathBuf> {
+    let base_name = format!("{}-{}", meta.safe_title, meta.id);
+    let output_template = config.output_dir.join(format!("{base_name}-video.%(ext)s"));
+
+    let mut command = Command::new(config.yt_dlp_path);
+    for arg in video_download_args() {
+        command.arg(arg);
+    }
+
+    command
+        .arg("-o")
+        .arg(output_template)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    if config.no_download_progress {
+        command.arg("--no-progress");
+    }
+
+    if config.print_command {
+        eprintln!("{}", render_command(&command));
+    }
+
+    let status = command
+        .status()
+        .with_context(|| format!("failed to execute `{}`", config.yt_dlp_path))?;
+
+    if !status.success() {
+        bail!("yt-dlp video download failed with status {status}");
+    }
+
+    find_downloaded_video(config.output_dir, &base_name)
+}
+
+/// Locate the kept video, preferring the MP4 that `--merge-output-format` asks
+/// for and otherwise accepting whatever container yt-dlp produced.
+fn find_downloaded_video(output_dir: &Path, base_name: &str) -> Result<PathBuf> {
+    let preferred = output_dir.join(format!("{base_name}-video.mp4"));
+    if preferred.is_file() {
+        return Ok(preferred);
+    }
+
+    let stem = format!("{base_name}-video");
+    let mut candidates: Vec<PathBuf> = fs::read_dir(output_dir)
+        .with_context(|| format!("failed to read `{}`", output_dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path.file_stem().and_then(|value| value.to_str()) == Some(stem.as_str())
+                && path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|extension| extension != "part" && extension != "ytdl")
+        })
+        .collect();
+    candidates.sort();
+
+    candidates
+        .pop()
+        .with_context(|| format!("yt-dlp did not produce a video file for `{base_name}`"))
+}
+
 fn download_audio(
     url: &str,
     model: &ModelProfile,
@@ -633,39 +802,8 @@ fn download_audio(
         .join(format!("{base_name}.{}", model.output_format));
 
     let mut command = Command::new(config.yt_dlp_path);
-    command.arg("--no-playlist");
-
-    if config.cloud_mode {
-        command.arg("-f").arg("bestaudio");
-    } else {
-        let postprocessor_args = format!(
-            "ffmpeg:-ac {} -ar {} -sample_fmt s16",
-            model.channels, model.sample_rate_hz
-        );
-        let ffmpeg_location = resolve_executable_path(config.ffmpeg_path);
-        let ffmpeg_arg_is_path = Path::new(config.ffmpeg_path).components().count() > 1;
-
-        if ffmpeg_arg_is_path && ffmpeg_location.is_none() {
-            bail!(
-                "ffmpeg path `{}` does not exist or is not executable",
-                config.ffmpeg_path
-            );
-        }
-
-        command
-            .arg("--extract-audio")
-            .arg("--audio-format")
-            .arg(model.output_format)
-            .arg("--audio-quality")
-            .arg("0")
-            .arg("--postprocessor-args")
-            .arg(postprocessor_args)
-            .arg("-f")
-            .arg(model.yt_dlp_format);
-
-        if let Some(path) = ffmpeg_location {
-            command.arg("--ffmpeg-location").arg(path);
-        }
+    for arg in audio_download_args(model, config.cloud_mode, config.ffmpeg_path)? {
+        command.arg(arg);
     }
 
     let downloaded_path_report = config.cloud_mode.then(unique_downloaded_path_report);
@@ -1497,5 +1635,126 @@ mod tests {
         assert!(path.is_file());
         drop(TempAudio { path: path.clone() });
         assert!(!path.exists(), "TempAudio should delete its file on drop");
+    }
+
+    fn unique_test_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            env::temp_dir().join(format!("yt-transcript-test-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).expect("test dir should be creatable");
+        dir
+    }
+
+    fn format_selector<S: AsRef<str>>(args: &[S]) -> String {
+        args.windows(2)
+            .find(|pair| pair[0].as_ref() == "-f")
+            .map(|pair| pair[1].as_ref().to_string())
+            .expect("args should include a format selector")
+    }
+
+    #[test]
+    fn cloud_mode_falls_back_to_a_muxed_stream() {
+        // Regression: cloud mode used a bare `bestaudio` selector, so any site
+        // offering muxed streams only (Dailymotion, for one) failed with
+        // "Requested format is not available".
+        let model = resolve_model(DEFAULT_MODEL_ID).expect("default model should resolve");
+        let args = audio_download_args(model, true, "ffmpeg").expect("cloud args should build");
+
+        assert_eq!(format_selector(&args), "bestaudio/best");
+        assert!(args.iter().any(|arg| arg == "--extract-audio"));
+    }
+
+    #[test]
+    fn cloud_mode_remuxes_instead_of_re_encoding() {
+        // The fallback now runs for every cloud download, so it must keep the
+        // source codec rather than re-encode lossily.
+        let model = resolve_model(DEFAULT_MODEL_ID).expect("default model should resolve");
+        let args = audio_download_args(model, true, "ffmpeg").expect("cloud args should build");
+        let format = args
+            .windows(2)
+            .find(|pair| pair[0] == "--audio-format")
+            .map(|pair| pair[1].clone())
+            .expect("cloud args should set an audio format");
+
+        assert_eq!(format, "best");
+    }
+
+    #[test]
+    fn local_mode_uses_the_model_format_chain() {
+        let model = resolve_model(DEFAULT_MODEL_ID).expect("default model should resolve");
+        let args = audio_download_args(model, false, "ffmpeg").expect("local args should build");
+
+        assert_eq!(format_selector(&args), model.yt_dlp_format);
+        assert!(
+            args.iter()
+                .any(|arg| arg == "ffmpeg:-ac 1 -ar 16000 -sample_fmt s16")
+        );
+    }
+
+    #[test]
+    fn video_args_request_the_best_stream_merged_to_mp4() {
+        let args = video_download_args();
+
+        assert_eq!(
+            format_selector(&video_download_args()),
+            "bestvideo*+bestaudio/best"
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--merge-output-format" && pair[1] == "mp4")
+        );
+    }
+
+    #[test]
+    fn keep_video_flag_parses() {
+        let cli = Cli::try_parse_from(["yt-transcript", "--keep-video", "https://example.com/v"])
+            .expect("CLI arguments should parse");
+        assert!(cli.keep_video);
+    }
+
+    #[test]
+    fn finds_the_kept_video_not_the_audio() {
+        let dir = unique_test_dir();
+        let base = "Title-xaynljy";
+        fs::write(dir.join(format!("{base}.m4a")), b"audio").expect("audio should be writable");
+        let expected = dir.join(format!("{base}-video.mp4"));
+        fs::write(&expected, b"video").expect("video should be writable");
+
+        let found = find_downloaded_video(&dir, base).expect("video should be found");
+        assert_eq!(found, expected);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reports_a_missing_video_instead_of_settling_for_audio() {
+        let dir = unique_test_dir();
+        let base = "Title-xaynljy";
+        fs::write(dir.join(format!("{base}.m4a")), b"audio").expect("audio should be writable");
+
+        assert!(find_downloaded_video(&dir, base).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kept_video_is_ignored_by_delete_audio() {
+        let dir = unique_test_dir();
+        let audio = dir.join("Title-xaynljy.m4a");
+        let video = dir.join("Title-xaynljy-video.mp4");
+        fs::write(&audio, b"audio").expect("audio should be writable");
+        fs::write(&video, b"video").expect("video should be writable");
+
+        remove_audio_file(&audio).expect("audio should be removable");
+        assert!(!audio.exists());
+        assert!(
+            video.is_file(),
+            "--delete-audio must not touch the kept video"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
