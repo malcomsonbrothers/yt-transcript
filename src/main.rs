@@ -288,13 +288,28 @@ impl DeviceMode {
     }
 }
 
+/// Fallback chain for sites that only publish muxed (video+audio) streams.
+///
+/// TikTok labels every muxed format as carrying AAC audio, but its H.265
+/// (`bytevc1`) files often have no audio track at all, and plain `best`
+/// picks exactly those. H.264 streams reliably carry the audio, so they are
+/// tried first; plain `best` stays last for sites without H.264.
+macro_rules! muxed_fallback {
+    () => {
+        "best[vcodec^=h264]/best[vcodec^=avc1]/best"
+    };
+}
+
 const MODELS: [ModelProfile; 2] = [
     ModelProfile {
         id: "nvidia/parakeet-tdt-0.6b-v3",
         display_name: "NVIDIA Parakeet TDT 0.6B v3",
         aliases: &["parakeet", "parakeet-v3"],
         notes: "Default. Optimized for high-throughput multilingual transcription.",
-        yt_dlp_format: "bestaudio[acodec*=opus]/bestaudio[abr>=128]/bestaudio/best",
+        yt_dlp_format: concat!(
+            "bestaudio[acodec*=opus]/bestaudio[abr>=128]/bestaudio/",
+            muxed_fallback!()
+        ),
         output_format: "wav",
         sample_rate_hz: 16_000,
         channels: 1,
@@ -307,7 +322,10 @@ const MODELS: [ModelProfile; 2] = [
         display_name: "NVIDIA Canary Qwen 2.5B",
         aliases: &["canary", "canary-qwen-2.5b"],
         notes: "Higher-accuracy English model.",
-        yt_dlp_format: "bestaudio[asr>=44100]/bestaudio[abr>=160]/bestaudio/best",
+        yt_dlp_format: concat!(
+            "bestaudio[asr>=44100]/bestaudio[abr>=160]/bestaudio/",
+            muxed_fallback!()
+        ),
         output_format: "wav",
         sample_rate_hz: 16_000,
         channels: 1,
@@ -675,7 +693,7 @@ fn audio_download_args(
                 "--audio-format",
                 "best",
                 "-f",
-                "bestaudio/best",
+                concat!("bestaudio/", muxed_fallback!()),
             ]
             .map(str::to_string),
         );
@@ -710,8 +728,9 @@ fn audio_download_args(
 
 /// yt-dlp arguments for the optional kept video.
 ///
-/// `bestvideo*+bestaudio/best` prefers separate streams and falls back to a
-/// single muxed one on sites that only publish that. Merging to MP4 keeps the
+/// `bestvideo*+bestaudio` prefers separate streams and falls back to a
+/// single muxed one (H.264 first, see `muxed_fallback!`) on sites that only
+/// publish that. Merging to MP4 keeps the
 /// container predictable across sites.
 fn video_download_args() -> [&'static str; 5] {
     [
@@ -719,7 +738,7 @@ fn video_download_args() -> [&'static str; 5] {
         "--merge-output-format",
         "mp4",
         "-f",
-        "bestvideo*+bestaudio/best",
+        concat!("bestvideo*+bestaudio/", muxed_fallback!()),
     ]
 }
 
@@ -1663,8 +1682,33 @@ mod tests {
         let model = resolve_model(DEFAULT_MODEL_ID).expect("default model should resolve");
         let args = audio_download_args(model, true, "ffmpeg").expect("cloud args should build");
 
-        assert_eq!(format_selector(&args), "bestaudio/best");
+        assert_eq!(
+            format_selector(&args),
+            concat!("bestaudio/", muxed_fallback!())
+        );
         assert!(args.iter().any(|arg| arg == "--extract-audio"));
+    }
+
+    #[test]
+    fn muxed_fallback_prefers_h264_before_plain_best() {
+        // Regression: TikTok's H.265 muxed files are listed with AAC audio but
+        // often have no audio track, so a bare `best` fallback downloaded a
+        // silent file and ffprobe failed. Every selector must try H.264 first.
+        let model = resolve_model(DEFAULT_MODEL_ID).expect("default model should resolve");
+        let cloud = audio_download_args(model, true, "ffmpeg").expect("cloud args should build");
+        let local = audio_download_args(model, false, "ffmpeg").expect("local args should build");
+        let video = video_download_args();
+
+        for selector in [
+            format_selector(&cloud),
+            format_selector(&local),
+            format_selector(&video),
+        ] {
+            assert!(
+                selector.ends_with("/best[vcodec^=h264]/best[vcodec^=avc1]/best"),
+                "selector `{selector}` should prefer H.264 muxed streams"
+            );
+        }
     }
 
     #[test]
@@ -1700,7 +1744,7 @@ mod tests {
 
         assert_eq!(
             format_selector(&video_download_args()),
-            "bestvideo*+bestaudio/best"
+            concat!("bestvideo*+bestaudio/", muxed_fallback!())
         );
         assert!(
             args.windows(2)
