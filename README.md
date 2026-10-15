@@ -38,6 +38,14 @@ Optional for local transcription:
 cargo install --path .
 ```
 
+Or, on macOS or Linux, install the binary, `yt-dlp`, `ffmpeg` and the Claude Code skill in one step:
+
+```bash
+./install.sh
+```
+
+The script symlinks `skills/yt-transcript` into `~/.claude/skills/` (override with `CLAUDE_SKILLS_DIR`).
+
 ## Releasing
 
 For the full release + Homebrew tap flow, see [docs/RELEASING.md](docs/RELEASING.md).
