@@ -81,6 +81,10 @@ List supported model IDs and their available runtimes:
 yt-transcript models list
 ```
 
+## Audio already on disk
+
+`--audio-file <path>` transcribes a local file and skips yt-dlp. Use it when this host cannot download from YouTube: YouTube signs stream links for the IP that requested them, and bot-blocked hosts get no audio from yt-dlp. Download on another machine, copy the file over, and pass it here. With `--local` the file must be 16 kHz mono WAV.
+
 ## Cloud uploads and limits
 
 The default path uploads downloaded audio to Together AI, a third-party service. Use `--local` if the audio must not leave your machine.
