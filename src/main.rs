@@ -9,6 +9,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 
+mod audio_file;
+
 const DEFAULT_MODEL_ID: &str = "nvidia/parakeet-tdt-0.6b-v3";
 const LOCAL_TRANSCRIBE_SCRIPT: &str = include_str!("nemo_transcribe.py");
 
@@ -30,6 +32,10 @@ const UPLOAD_SHRINK_BITRATE: &str = "32k";
 struct Cli {
     /// YouTube video URL to download audio from.
     url: Option<String>,
+
+    /// Transcribe this audio file instead of downloading `url` (no yt-dlp).
+    #[arg(long, conflicts_with_all = ["url", "keep_video", "delete_audio"])]
+    audio_file: Option<PathBuf>,
 
     /// Model identifier (prefer Hugging Face IDs from `yt-transcript models list`).
     #[arg(long, default_value = DEFAULT_MODEL_ID)]
@@ -355,10 +361,9 @@ fn main() -> Result<()> {
     })?;
     validate_transcription_options(&cli, model, together_api_key)?;
 
-    let url = cli
-        .url
-        .as_deref()
-        .context("a URL is required unless using a subcommand")?;
+    if let Some(audio_file) = &cli.audio_file {
+        audio_file::validate(audio_file, cli.local)?;
+    }
     let backend = transcription_backend(cli.local);
     let cloud_mode = backend == TranscriptionBackend::TogetherCloud;
 
@@ -369,46 +374,69 @@ fn main() -> Result<()> {
         )
     })?;
 
-    stage(&format!("resolving video metadata for {url}"));
-    let metadata_started_at = Instant::now();
-    let video_meta = fetch_video_metadata(url, &cli.yt_dlp_path, cli.print_command)?;
-    let metadata_duration = metadata_started_at.elapsed();
-    stage(&format!(
-        "video metadata resolved in {}",
-        format_duration(metadata_duration)
-    ));
+    let (transcript_default, audio_path, metadata_duration, download_duration, video_path) =
+        if let Some(audio_file) = &cli.audio_file {
+            stage(&format!("using audio file {}", audio_file.display()));
+            (
+                audio_file::transcript_path(&cli.output_dir, audio_file),
+                audio_file.clone(),
+                Duration::ZERO,
+                Duration::ZERO,
+                None,
+            )
+        } else {
+            let url = cli
+                .url
+                .as_deref()
+                .context("a URL or `--audio-file` is required unless using a subcommand")?;
+            stage(&format!("resolving video metadata for {url}"));
+            let metadata_started_at = Instant::now();
+            let video_meta = fetch_video_metadata(url, &cli.yt_dlp_path, cli.print_command)?;
+            let metadata_duration = metadata_started_at.elapsed();
+            stage(&format!(
+                "video metadata resolved in {}",
+                format_duration(metadata_duration)
+            ));
 
-    stage(&format!("downloading audio for model {}", model.id));
-    let download_started_at = Instant::now();
-    let download_config = DownloadConfig {
-        output_dir: &cli.output_dir,
-        yt_dlp_path: &cli.yt_dlp_path,
-        ffmpeg_path: &cli.ffmpeg_path,
-        cloud_mode,
-        print_command: cli.print_command,
-        no_download_progress: cli.no_download_progress,
-    };
-    let audio_path = download_audio(url, model, &video_meta, &download_config)?;
-    let download_duration = download_started_at.elapsed();
-    stage(&format!(
-        "audio downloaded in {}",
-        format_duration(download_duration)
-    ));
+            stage(&format!("downloading audio for model {}", model.id));
+            let download_started_at = Instant::now();
+            let download_config = DownloadConfig {
+                output_dir: &cli.output_dir,
+                yt_dlp_path: &cli.yt_dlp_path,
+                ffmpeg_path: &cli.ffmpeg_path,
+                cloud_mode,
+                print_command: cli.print_command,
+                no_download_progress: cli.no_download_progress,
+            };
+            let audio_path = download_audio(url, model, &video_meta, &download_config)?;
+            let download_duration = download_started_at.elapsed();
+            stage(&format!(
+                "audio downloaded in {}",
+                format_duration(download_duration)
+            ));
 
-    let video_path = if cli.keep_video {
-        stage("downloading video to keep");
-        let video_started_at = Instant::now();
-        let path = download_video(url, &video_meta, &download_config)?;
-        let video_bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
-        stage(&format!(
-            "video downloaded in {} ({})",
-            format_duration(video_started_at.elapsed()),
-            format_megabytes(video_bytes)
-        ));
-        Some(path)
-    } else {
-        None
-    };
+            let video_path = if cli.keep_video {
+                stage("downloading video to keep");
+                let video_started_at = Instant::now();
+                let path = download_video(url, &video_meta, &download_config)?;
+                let video_bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+                stage(&format!(
+                    "video downloaded in {} ({})",
+                    format_duration(video_started_at.elapsed()),
+                    format_megabytes(video_bytes)
+                ));
+                Some(path)
+            } else {
+                None
+            };
+            (
+                build_transcript_path(&cli, &video_meta),
+                audio_path,
+                metadata_duration,
+                download_duration,
+                video_path,
+            )
+        };
 
     stage(&format!(
         "transcribing with {} ({})",
@@ -449,7 +477,7 @@ fn main() -> Result<()> {
         );
     }
 
-    let transcript_path = build_transcript_path(&cli, &video_meta);
+    let transcript_path = cli.transcript_path.clone().unwrap_or(transcript_default);
     if let Some(parent) = transcript_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create `{}`", parent.display()))?;
